@@ -1,9 +1,35 @@
 // A naive implementation of Conway's Game of Life!
 
+use crossterm::{
+    event::{self, KeyCode, KeyEventKind},
+    terminal::{
+        disable_raw_mode, enable_raw_mode, EnterAlternateScreen,
+        LeaveAlternateScreen,
+    },
+    ExecutableCommand,
+};
+use ratatui::{
+    prelude::{CrosstermBackend, Stylize, Terminal},
+    widgets::Paragraph,
+};
+use std::io::{stdout, Result, Stdout};
+
 use std::io;
 use rand::Rng;
 use std::{thread, time};
+use std::cmp::{max, min};
+use ratatui::layout::{Rect};
+use ratatui::symbols::border;
+use ratatui::widgets::{Block, Borders};
+use ratatui::widgets::block::Title;
 
+enum LoopAction {
+    Continue,
+    Quit,
+    Restart,
+    SlowDown,
+    SpeedUp,
+}
 
 struct Vector {
     x: i32,
@@ -59,10 +85,11 @@ struct World {
     frames: u64,
     size: Vector,
     cells: Vec<Vec<Cell>>,
+    changed: bool,
 }
 
 impl World {
-    fn new(size: Vector, life_chance: f64) -> World {
+    fn new(size: &Vector, life_chance: f64) -> World {
         let mut cells = Vec::new();
 
         for x in 0..size.x {
@@ -78,10 +105,15 @@ impl World {
             cells.push(row);
         }
 
-        World { frames: 0, cells, size }
+        World {
+            frames: 0,
+            cells,
+            size: Vector { x: size.x, y: size.y },
+            changed: false,
+        }
     }
 
-    fn tick(&mut self) -> bool {
+    fn tick(&mut self) {
         let mut new_states = Vec::new();
 
         for x in 0..self.size.x {
@@ -109,60 +141,153 @@ impl World {
         }
 
         self.frames += 1;
-
-        did_change
+        self.changed = did_change;
     }
 
-    fn draw_world(&self) {
-        let border = format!("+{}+", "-".repeat(self.size.x as usize));
-        println!("{}", border);
+    fn draw_world(&self) -> String {
+        let mut result = "".to_string();
 
         for y in 0..self.size.y {
-            print!("|");
             for x in 0..self.size.x {
-                print!("{}", if self.cells[x as usize][y as usize].alive { "#" } else { " " });
+                result.push_str(
+                    format!("{}", if self.cells[x as usize][y as usize].alive { "#" } else { " " }).as_str()
+                );
             }
-            print!("|");
-            println!();
+            result.push_str("\n");
         }
 
-        println!("{}", border);
+        return result;
     }
 }
 
 const WORLD_MIN: Vector = Vector { x: 0, y: 0 };
 
-fn main() {
-    clear_screen();
-
+fn main() -> Result<()> {
     let world_size = ask_for_world_size();
-
     println!("World size: {}x{}", world_size.x, world_size.y);
 
-    let mut world = World::new(world_size, 0.2);
+    let mut terminal = setup_terminal()?;
+    clear_terminal(&mut terminal)?;
 
-    let sleep_duration = time::Duration::from_millis(10);
+    let mut world = World::new(&world_size, 0.5);
+
+    let mut milliseconds = 10;
+    let mut sleep_duration = time::Duration::from_millis(milliseconds);
 
     loop {
-        clear_screen();
+        world.tick();
 
-        let world_changed = world.tick();
-        world.draw_world();
+        draw_ui(&mut terminal, &world, &milliseconds)?;
 
-        println!("Frame: {}", world.frames);
+        let loop_action = request_loop_action()?;
 
-        if !world_changed {
-            println!("World has reached a stable state");
-            break;
+        match loop_action {
+            LoopAction::SlowDown => {
+                milliseconds = milliseconds + 10;
+                sleep_duration = time::Duration::from_millis(milliseconds);
+            }
+            LoopAction::SpeedUp => {
+                milliseconds = max(10, milliseconds - 10);
+                sleep_duration = time::Duration::from_millis(milliseconds);
+            }
+            LoopAction::Quit => break,
+            LoopAction::Restart => {
+                world = World::new(&world_size, 0.5);
+            }
+            LoopAction::Continue => {}
         }
 
         thread::sleep(sleep_duration);
     }
+
+    stdout().execute(LeaveAlternateScreen)?;
+    disable_raw_mode()?;
+    Ok(())
 }
 
-fn clear_screen() {
-    // print!("\x1B[2J\x1B[1;1H");
-    clearscreen::clear().expect("failed to clear screen");
+fn draw_ui(terminal: &mut Terminal<CrosstermBackend<Stdout>>, world: &World, sleep_delay: &u64) -> Result<()> {
+    terminal.draw(|frame| {
+        let frame_rect = frame.size();
+
+        let info_rect = Rect::new(
+            0,
+            0,
+            frame_rect.width,
+            3,
+        );
+        let world_rect = Rect::new(
+            0,
+            3,
+            min(world.size.x as u16, frame_rect.width),
+            min(frame_rect.height - info_rect.height, frame_rect.height),
+        );
+
+        let info_block = Block::default()
+            .title(Title::from("Rust Conway".bold()))
+            .borders(Borders::ALL)
+            .border_set(border::THICK);
+
+        let world_block = Block::default()
+            .title("World")
+            .borders(Borders::ALL)
+            .border_set(border::THICK);
+
+        let info = format!(
+            "{}uit / {}estart / {} slow down / {} speed up // {} // {}ms // Frame: {}",
+            "[q]".bold().underlined(),
+            "[r]".bold().underlined(),
+            "[-]".bold().underlined(),
+            "[+]".bold().underlined(),
+            if world.changed { "Generating" } else { "Stable" },
+            sleep_delay,
+            world.frames
+        );
+
+        let info_paragraph = Paragraph::new(info)
+            .white().on_blue()
+            .block(info_block);
+
+        let world_paragaph = Paragraph::new(world.draw_world())
+            .white().on_black()
+            .block(world_block);
+
+        frame.render_widget(info_paragraph, info_rect);
+        frame.render_widget(world_paragaph, world_rect);
+    })?;
+    Ok(())
+}
+
+fn request_loop_action() -> Result<LoopAction> {
+    if event::poll(std::time::Duration::from_millis(1))? {
+        if let event::Event::Key(key) = event::read()? {
+            if key.kind != KeyEventKind::Press {
+                return Ok(LoopAction::Continue);
+            }
+
+            return match key.code {
+                KeyCode::Char('q') => Ok(LoopAction::Quit),
+                KeyCode::Char('r') => Ok(LoopAction::Restart),
+                KeyCode::Char('-') => Ok(LoopAction::SlowDown),
+                KeyCode::Char('+') => Ok(LoopAction::SpeedUp),
+                KeyCode::Char('=') => Ok(LoopAction::SpeedUp),
+                _ => Ok(LoopAction::Continue),
+            };
+        }
+    }
+
+    // Continue...
+    Ok(LoopAction::Continue)
+}
+
+fn setup_terminal() -> Result<Terminal<CrosstermBackend<Stdout>>> {
+    stdout().execute(EnterAlternateScreen)?;
+    enable_raw_mode()?;
+    Terminal::new(CrosstermBackend::new(stdout()))
+}
+
+fn clear_terminal(terminal: &mut Terminal<CrosstermBackend<Stdout>>) -> Result<()> {
+    terminal.clear()?;
+    Ok(())
 }
 
 fn ask_for_world_size() -> Vector {
